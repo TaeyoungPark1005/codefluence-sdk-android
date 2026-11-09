@@ -136,6 +136,7 @@ class Codefluence private constructor(
         schedule: ((Long, () -> Unit) -> Unit)? = null
     ) {
         appUserIdProvider.set(appUserId)
+        heartbeat() // 하루 한 번. 대시보드의 「SDK 신호」가 첫 실행에 바로 뜬다.
         val run = schedule ?: { delay, work -> mainHandler?.postDelayed(work, delay) ?: work() }
         run(launchGraceMs) { resume() }
     }
@@ -259,22 +260,78 @@ class Codefluence private constructor(
 
     interface AttestationProvider { fun token(onToken: (String?) -> Unit) }
     /** Sends one aggregate heartbeat per local day; integrity verification is injected. */
-    fun heartbeat(appVersion: String = "unknown", sdkVersion: String = "1", attestation: AttestationProvider? = null, onResult: (Result<Unit>) -> Unit = {}) {
+    fun heartbeat(appVersion: String = hostAppVersion(), sdkVersion: String = VERSION, attestation: AttestationProvider? = null, onResult: (Result<Unit>) -> Unit = {}) {
         val day = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(java.util.Date())
         val key = "heartbeat.$day"
         if (preferences.getBoolean(key, false)) { onResult(Result.success(Unit)); return }
-        val send: (String?) -> Unit = { assertion -> workExecutor { var connection: HttpURLConnection? = null
-        val result = runCatching {
-            val request = (URL("$apiHost/sdk/heartbeat").openConnection() as HttpURLConnection).apply {
-                connectTimeout = 5_000; readTimeout = 5_000; requestMethod = "POST"; doOutput = true
-                setRequestProperty("Authorization", "Bearer $publicKey"); setRequestProperty("Content-Type", "application/json")
-            }; connection = request
-            request.outputStream.use { it.write(JSONObject(mapOf("appVersion" to appVersion, "sdkVersion" to sdkVersion, "attestation" to assertion)).toString().toByteArray()) }
-            if (request.responseCode !in 200..299) error("Codefluence heartbeat failed: ${request.responseCode}")
-            preferences.edit().putBoolean(key, true).apply(); Unit
-        }
-        connection?.disconnect(); mainExecutor { onResult(result) } } }
+        val send: (String?) -> Unit = { assertion -> workExecutor {
+            val result = runCatching {
+                val status = postHeartbeat(appVersion, sdkVersion, assertion)
+                if (status !in 200..299) error("Codefluence heartbeat failed: $status")
+                preferences.edit().putBoolean(key, true).apply(); Unit
+            }
+            mainExecutor { onResult(result) } } }
         if (attestation == null) send(null) else attestation.token(send)
+    }
+
+    /** 서버가 받는 계약 그대로 보냅니다: `platform`은 필수이고, 증명이 없으면 `attestation` 키를 뺍니다. */
+    private fun postHeartbeat(appVersion: String, sdkVersion: String, attestation: String?): Int {
+        val body = JSONObject().put("platform", "android").put("appVersion", appVersion).put("sdkVersion", sdkVersion)
+        if (attestation != null) body.put("attestation", attestation)
+        val headers = mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json")
+        return transport.send("$apiHost/sdk/heartbeat", headers, body.toString()).status
+    }
+
+    private fun hostAppVersion(): String = context?.let { host ->
+        runCatching { host.packageManager.getPackageInfo(host.packageName, 0).versionName }.getOrNull()
+    } ?: "unknown"
+
+    /** 앱 URL 스킴(`scheme://referral`)을 받는 Activity가 이 앱에 등록돼 있는지. 테스트가 바꿉니다. */
+    internal var schemeRegistered: (String) -> Boolean = { scheme ->
+        context?.let { host ->
+            runCatching {
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse("$scheme://referral")).addCategory(android.content.Intent.CATEGORY_BROWSABLE)
+                host.packageManager.queryIntentActivities(intent, 0).any { it.activityInfo?.packageName == host.packageName }
+            }.getOrDefault(false)
+        } ?: false
+    }
+
+    /**
+     * 출시 전 설치 점검. 키 모양, 서버 접속과 키 유효성(heartbeat를 실제로 보내므로 대시보드에 첫 신호가 바로 뜹니다),
+     * 선택적으로 앱 URL 스킴 등록을 확인하고 항목별 통과·실패와 고칠 방법을 돌려줍니다. 결과는 Logcat에도 `Codefluence` 태그로 남깁니다.
+     * 디버그 빌드에서 부르세요. 토큰·키 값은 어디에도 출력하지 않습니다.
+     */
+    fun validate(urlScheme: String? = null, onResult: (List<CodefluenceCheck>) -> Unit) {
+        val checks = mutableListOf<CodefluenceCheck>()
+        val configured = publicKey.startsWith("pk_") && publicKey.length > 3
+        checks += when {
+            configured -> CodefluenceCheck("설정", true, "pk_ 공개 키와 서버 주소가 설정돼 있어요")
+            publicKey.startsWith("sk_") -> CodefluenceCheck("설정", false, "비밀 키(sk_)가 앱에 들어 있어요. 앱에는 pk_ 공개 키만 넣고 sk_ 키는 폐기하세요")
+            else -> CodefluenceCheck("설정", false, "pk_ 공개 키와 서버 주소(https://…)를 start 또는 configure에 넣으세요. BuildConfig 값이 비어 있지 않은지 확인하세요")
+        }
+        val finish: () -> Unit = {
+            if (urlScheme != null) {
+                val registered = schemeRegistered(urlScheme)
+                checks += CodefluenceCheck("URL 스킴", registered, if (registered) "$urlScheme:// 스킴이 앱에 등록돼 있어요"
+                    else "AndroidManifest의 Activity에 scheme $urlScheme, host referral인 intent-filter(VIEW·DEFAULT·BROWSABLE)를 등록하세요. 대시보드 제품 화면의 「앱 열기 스킴」에도 같은 값을 저장해야 소개 링크가 앱을 열어요")
+            }
+            checks.forEach { android.util.Log.i("Codefluence", "${if (it.passed) "✓" else "✗"} ${it.name}: ${it.hint}") }
+            mainExecutor { onResult(checks.toList()) }
+        }
+        if (!configured) { finish(); return }
+        workExecutor {
+            val server = runCatching { postHeartbeat(hostAppVersion(), VERSION, null) }.fold(
+                onSuccess = { status -> when (status) {
+                    in 200..299 -> CodefluenceCheck("서버와 키", true, "서버가 키를 받아들였고 첫 신호가 도착했어요")
+                    401, 403 -> CodefluenceCheck("서버와 키", false, "서버가 키를 거절했어요. pk_ 공개 키가 이 제품의 키가 맞는지, 폐기되지 않았는지 대시보드 「키와 결제 알림」에서 확인하세요")
+                    422 -> CodefluenceCheck("서버와 키", false, "키의 제품 플랫폼이 Android가 아니에요. Android 제품의 pk_ 키를 쓰세요(iOS 제품 키와 섞이지 않았는지 확인)")
+                    else -> CodefluenceCheck("서버와 키", false, "서버가 ${status}을 돌려줬어요. 잠시 뒤 다시 시도하고 계속되면 서버 주소를 확인하세요")
+                } },
+                onFailure = { CodefluenceCheck("서버와 키", false, "서버에 연결하지 못했어요. 서버 주소(${runCatching { java.net.URI(apiHost).host }.getOrNull() ?: "?"})와 기기의 네트워크, 로컬 서버라면 cleartext 설정을 확인하세요") }
+            )
+            checks += server
+            finish()
+        }
     }
 
     private fun looksLikeSignedToken(value: String): Boolean = value.matches(Regex("^[^./?#]+\\.[^./?#]+\\.[0-9]+\\.[A-Za-z0-9_-]+$"))
@@ -611,6 +668,8 @@ class Codefluence private constructor(
     }
 
     companion object {
+        /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
+        const val VERSION = "0.1.1"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()

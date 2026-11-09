@@ -21,7 +21,7 @@ codefluence.purchaseCompleted() // 결제가 끝났을 때(어떤 구매 SDK든)
 
 ## 설치
 
-JitPack으로 배포합니다. 앱의 `settings.gradle.kts`(또는 루트 `build.gradle`)에 저장소를 추가하고 의존성을 넣습니다. `kotlin-stdlib`과 Play Install Referrer는 전이 의존성으로 함께 들어옵니다.
+JitPack으로 배포합니다. 앱의 `settings.gradle.kts`에 저장소를 추가하고 의존성을 넣습니다. `kotlin-stdlib`과 Play Install Referrer는 전이 의존성으로 함께 들어옵니다.
 
 ```kotlin
 // settings.gradle.kts
@@ -34,11 +34,23 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.1.0")
+    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.1.1")
 }
 ```
 
-minSdk 23, compileSdk 35, Kotlin 2.0.21·Android Gradle Plugin 8.7.3 기준으로 만들었습니다. 구매 조회는 호스트가 이미 쓰는 Play Billing(`billing` 라이브러리)을 사용하며 SDK는 이를 직접 가져오지 않습니다.
+minSdk 23, compileSdk 35, Kotlin 2.0.21·Android Gradle Plugin 8.7.3 기준입니다. 구매 조회는 호스트가 이미 쓰는 Play Billing(`billing` 라이브러리)을 사용하며 SDK는 이를 직접 가져오지 않습니다.
+
+## 출시 전 설치 점검
+
+```kotlin
+if (BuildConfig.DEBUG) {
+    codefluence.validate(urlScheme = "myapp") { checks ->
+        // Logcat 태그 Codefluence에 ✓/✗ 항목: 안내가 남습니다.
+    }
+}
+```
+
+점검 항목: ① 설정(pk_ 키 모양·서버 주소, 비밀 키 sk_가 들어 있으면 실패) ② 서버와 키(실제로 heartbeat를 보내 키가 받아들여지는지, 플랫폼이 맞는지, 서버에 닿는지) ③ URL 스킴(`urlScheme`을 넘겼을 때 AndroidManifest의 intent-filter에 등록돼 있는지). 실패하면 무엇을 고쳐야 하는지가 `hint`에 나옵니다. 통과하면 서버에 첫 신호가 도착해 대시보드 제품 연동 화면의 「앱 SDK 신호」가 바로 바뀝니다. `start`도 하루에 한 번 같은 신호를 자동으로 보냅니다. 토큰·키 값은 출력하지 않습니다. 디버그 빌드에서만 호출하세요.
 
 ## 설정과 자동 귀속
 

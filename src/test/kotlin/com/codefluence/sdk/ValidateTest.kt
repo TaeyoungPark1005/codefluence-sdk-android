@@ -84,3 +84,17 @@ class ValidateTest {
         assertEquals("시작만 해도 SDK 신호가 가야 하고 같은 날 두 번 보내지 않는다", 1, transport.captured.count { it.url.endsWith("/sdk/heartbeat") })
     }
 }
+
+class ConfirmationRejectedTest {
+    @Test fun serverRejectionOfAnotherInstallIsADedicatedNonRetryableError() {
+        val transport = ScriptedTransport().also { it.reply = { CodefluenceHttpResponse(409, "{\"error\":\"confirmation_rejected\"}") } }
+        val signed = "6902082a-b202-4f7f-9b61-6ec419fb3b81.481e73f0-b627-482a-9466-5bc004807ff9.1796533770.UTM7ns4CUi-k-rI8rPXizYq5kjXadqEi5hP_jSA2JYM"
+        val sdk = Codefluence.createForTest("pk_fixture", "https://api.example.test", TestPreferences(mapOf("clickToken" to signed)), transport)
+        var result: Result<String?>? = null
+        sdk.autoConfirmIfAvailable("user-1") { result = it }
+        val error = result!!.exceptionOrNull()
+        org.junit.Assert.assertTrue("got: $error / transport=${transport.captured.map { it.url }}", error is CodefluenceError.ConfirmationRejected)
+        org.junit.Assert.assertEquals(14, (error as CodefluenceError).code)
+        org.junit.Assert.assertFalse(error.isRetryable)
+    }
+}

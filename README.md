@@ -34,7 +34,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.1.1")
+    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.1.2")
 }
 ```
 
@@ -152,6 +152,7 @@ codefluence.retryPendingConfirmation { result ->
 | 11 | `NotConfigured` | 미설정(pk_ 키) | 불가 |
 | 12 | `NoSubscriptionReference` | 저장된 lead/purchaseAccountToken 없음 | 불가 |
 | 13 | `SubscriptionNotFound` | 서버에 구독 기록 없음(404) | 불가 |
+| 14 | `ConfirmationRejected` | 서버가 같은 고객의 다른 설치 확인을 거절(409). 앱을 다시 설치했거나 `appUserId`가 겹친 경우 | 불가 |
 
 ```kotlin
 result.onFailure { error ->

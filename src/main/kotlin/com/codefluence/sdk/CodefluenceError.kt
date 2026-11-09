@@ -38,4 +38,6 @@ sealed class CodefluenceError(val code: Int, message: String, val isRetryable: B
     object NoSubscriptionReference : CodefluenceError(12, "No confirmed referral is available to read subscription status")
     /** code 13 — the server has no subscription record for the saved references. */
     object SubscriptionNotFound : CodefluenceError(13, "No subscription record was found for this customer")
+    /** code 14 — the server rejected this install's confirmation because the customer was already confirmed by another install (for example after a reinstall, or an ID collision). Retrying will not help. */
+    object ConfirmationRejected : CodefluenceError(14, "Referral confirmation was rejected: this customer was already confirmed by another install")
 }

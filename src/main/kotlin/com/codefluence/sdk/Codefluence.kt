@@ -605,7 +605,7 @@ class Codefluence private constructor(
             } catch (error: Throwable) {
                 // No HTTP status means a transport failure: retryable.
                 if (failureClass == null) failureClass = ConfirmationFailureClass.RETRYABLE
-                Result.failure(CodefluenceError.RequestFailed(error.message ?: "Referral confirmation request failed"))
+                Result.failure(if (error.message == "Codefluence confirm failed: 409") CodefluenceError.ConfirmationRejected else CodefluenceError.RequestFailed(error.message ?: "Referral confirmation request failed"))
             } finally {
                 gate.endRequest()
             }
@@ -664,12 +664,14 @@ class Codefluence private constructor(
             CodefluenceError.Declined
         "Referral confirmation is already in progress" ->
             CodefluenceError.RequestInProgress
+        "Codefluence confirm failed: 409" ->
+            CodefluenceError.ConfirmationRejected
         else -> CodefluenceError.RequestFailed(message)
     }
 
     companion object {
         /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
-        const val VERSION = "0.1.1"
+        const val VERSION = "0.1.2"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()

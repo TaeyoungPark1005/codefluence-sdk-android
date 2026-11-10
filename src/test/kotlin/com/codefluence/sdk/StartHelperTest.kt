@@ -1,6 +1,7 @@
 package com.codefluence.sdk
 
 import org.json.JSONObject
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -70,7 +71,7 @@ class StartHelperTest {
     @Test fun graceElapsedWithoutAnyLinkRecordsNoAttributionOnce() {
         val f = fixture { "user-1" }
         f.timers.toList().forEach { it() }
-        assertTrue(f.preferences.getBoolean("decisionMade", false))
+        assertTrue(f.preferences.getBoolean("noTokenAtLaunch", false))
         assertTrue(f.confirms().isEmpty())
     }
 
@@ -84,4 +85,39 @@ class StartHelperTest {
         assertTrue("확인 직후 SDK가 결제를 보고한다", afterConfirm >= 1)
         assertEquals("lead-fixture", JSONObject(f.purchases().first().body).getString("leadId"))
     }
+    @Test fun laterLinkRestoresSoftStartAndDoesNotReplaceConfirmedLead() {
+        val f = fixture { "user-1" }
+        f.timers.toList().forEach { it() }
+        assertTrue(f.sdk.handle("adledger://referral?cf_click_token=$token"))
+        assertEquals(1, f.confirms().size)
+        assertEquals("later", f.confirms().single().getString("launchKind"))
+        f.sdk.handle("adledger://referral?cf_click_token=$token")
+        assertEquals(1, f.confirms().size)
+    }
+
+    @Test fun nullLeadReturnsToSoftStateAndNeedsANewLink() {
+        val f = fixture { "user-1" }
+        f.timers.toList().forEach { it() }
+        f.transport.reply = { CodefluenceHttpResponse(200, "{\"leadId\":null,\"reason\":\"existing_users_not_included\"}") }
+        var result: Result<String?>? = null
+        f.sdk.handle("adledger://referral?cf_click_token=$token")
+        f.sdk.autoConfirmIfAvailable("user-1") { result = it }
+        assertTrue(requireNotNull(result).isSuccess)
+        assertNull(requireNotNull(result).getOrNull())
+        assertFalse(f.preferences.getBoolean("decisionMade", false))
+        assertFalse(f.preferences.getBoolean("accepted", false))
+        assertFalse(f.preferences.contains("pendingToken"))
+        assertEquals(1, f.confirms().size)
+        f.sdk.resume()
+        assertEquals(1, f.confirms().size)
+    }
+
+    @Test fun explicitDeclineCannotBeRevivedByHandle() {
+        val f = fixture { "user-1" }
+        f.preferences.edit().putBoolean("decisionMade", true).putBoolean("accepted", false).apply()
+        f.sdk.handle("adledger://referral?cf_click_token=$token")
+        assertTrue(f.confirms().isEmpty())
+        assertFalse(f.preferences.contains("clickToken"))
+    }
+
 }

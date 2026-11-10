@@ -96,6 +96,7 @@ class Codefluence private constructor(
     }
 
     fun restoreReferralToken(installReferrer: String? = null): String? {
+        if (preferences.getBoolean("noTokenAtLaunch", false)) return preferences.getString("laterLinkToken", null)
         preferences.getString("clickToken", null)?.takeIf { it.isNotBlank() }?.let { return it }
         val referrerToken = installReferrer
             ?.let { value ->
@@ -115,8 +116,10 @@ class Codefluence private constructor(
     }
 
     /** Accepts only an https://<configured-host>/t/<token> URL. */
-    fun handleOpenURL(uri: Uri): String? = (validReferralUrl(uri.toString()) ?: uri.takeIf { it.host == "referral" }?.getQueryParameter("cf_click_token")?.takeIf { it.isNotBlank() })?.also {
-        preferences.edit().putString("clickToken", it).apply()
+    fun handleOpenURL(uri: Uri): String? {
+        val token = referralTokenFrom(uri.toString()) ?: return null
+        decisions.acceptLink(token)
+        return token
     }
 
     // ---- One-call helper -------------------------------------------------------------------
@@ -150,9 +153,32 @@ class Codefluence private constructor(
 
     fun handle(url: String): Boolean {
         val token = referralTokenFrom(url) ?: return false
-        if (!preferences.getBoolean("decisionMade", false)) preferences.edit().putString("clickToken", token).apply()
+        decisions.acceptLink(token)
+        // 이미 소개로 확인된 설치가 다른 링크를 다시 열었다: 첫 소개자는 그대로 두고, 서버에 "이 링크를 열었다"만 알린다.
+        // 소모성(일회성) 재결제를 결제 직전에 연 링크의 크리에이터에게 귀속하는 근거다.
+        if (preferences.contains("confirmedLeadId") && token != preferences.getString("clickToken", null)) reportReferralTouch(token)
         resume()
         return true
+    }
+
+    /**
+     * 확인된 설치가 다른 크리에이터의 링크를 다시 열었음을 `/track/touch`로 알린다. 서버가 받아들였거나 영구 오류로 거절한 링크는 다시 보내지 않고,
+     * 일시 오류·연결 실패는 같은 링크를 다시 열 때 다시 시도한다. 응답은 기록 여부만 알려 주며 앱 동작에는 영향이 없다.
+     */
+    private fun reportReferralTouch(token: String) {
+        val appUserId = preferences.getString("confirmedAppUserId", null) ?: return
+        val installToken = preferences.getString("purchaseAccountToken", null) ?: return
+        val reported = runCatching { org.json.JSONArray(preferences.getString("touchedTokens", "[]")).let { array -> (0 until array.length()).map { array.getString(it) } } }.getOrDefault(emptyList())
+        if (token in reported) return
+        workExecutor {
+            val status = runCatching {
+                transport.send("$apiHost/track/touch", mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json"),
+                    JSONObject().put("clickToken", token).put("appUserId", appUserId).put("purchaseAccountToken", installToken).toString()).status
+            }.getOrNull()
+            if (status != null && (status in 200..299 || status in setOf(400, 401, 403, 404, 409, 422))) {
+                preferences.edit().putString("touchedTokens", org.json.JSONArray((reported + token).takeLast(20)).toString()).apply()
+            }
+        }
     }
 
     /**
@@ -525,6 +551,7 @@ class Codefluence private constructor(
     }
 
     private fun resolveReferralToken(installReferrer: String?, onToken: (String?) -> Unit) {
+        if (preferences.getBoolean("noTokenAtLaunch", false)) { onToken(preferences.getString("laterLinkToken", null)); return }
         if (!preferences.getString("clickToken", null).isNullOrBlank() || !installReferrer.isNullOrBlank()) {
             onToken(restoreReferralToken(installReferrer))
             return
@@ -584,6 +611,7 @@ class Codefluence private constructor(
                     if (!idempotencyKey.isNullOrEmpty()) put("Idempotency-Key", idempotencyKey)
                 }
                 val body = JSONObject(mapOf("clickToken" to token, "appUserId" to appUserId))
+                body.put("launchKind", preferences.getString("pendingLaunchKind", "first_launch"))
                 body.put("purchaseAccountToken", purchaseAccountToken())
                 val response = transport.send("$apiHost/track/confirm", headers, body.toString())
                 if (response.status !in 200..299) {
@@ -591,17 +619,24 @@ class Codefluence private constructor(
                     throw IllegalStateException("Codefluence confirm failed: ${response.status}")
                 }
                 val parsed = JSONObject(response.body)
-                val leadId = parsed.optString("leadId").takeIf { it.isNotBlank() }
+                if (parsed.isNull("leadId") && parsed.optString("reason") == "existing_users_not_included") {
+                    clearPendingQueue()
+                    preferences.edit().putBoolean("noTokenAtLaunch", true).remove("decisionMade").remove("accepted")
+                        .remove("laterLinkToken").remove("clickToken").apply()
+                    Result.success(null)
+                } else {
+                    val leadId = parsed.optString("leadId").takeIf { it.isNotBlank() }
                     ?: throw IllegalStateException("Codefluence confirm returned no valid lead ID")
                 val editor = preferences.edit().putString("confirmedLeadId", leadId).putString("confirmedAppUserId", appUserId)
                     .remove("pendingToken").remove("pendingAppUserId")
-                    .remove("pendingIdempotencyKey").remove("pendingAttempts")
+                    .remove("pendingIdempotencyKey").remove("pendingLaunchKind").remove("pendingAttempts")
                 parsed.optString("purchaseAccountToken").takeIf { it.isNotBlank() }?.let {
                     editor.putString("confirmedPurchaseAccountToken", it)
                 }
                 editor.apply()
                 reportPurchases()
                 Result.success(leadId)
+                }
             } catch (error: Throwable) {
                 // No HTTP status means a transport failure: retryable.
                 if (failureClass == null) failureClass = ConfirmationFailureClass.RETRYABLE
@@ -619,7 +654,7 @@ class Codefluence private constructor(
 
     private fun clearPendingQueue() {
         preferences.edit().remove("pendingToken").remove("pendingAppUserId")
-            .remove("pendingIdempotencyKey").remove("pendingAttempts").apply()
+            .remove("pendingIdempotencyKey").remove("pendingLaunchKind").remove("pendingAttempts").apply()
         retryScheduled.set(false)
     }
 
@@ -671,7 +706,7 @@ class Codefluence private constructor(
 
     companion object {
         /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
-        const val VERSION = "0.1.2"
+        const val VERSION = "0.1.3"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()

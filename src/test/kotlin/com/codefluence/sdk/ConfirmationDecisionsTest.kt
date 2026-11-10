@@ -8,15 +8,15 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class ConfirmationDecisionsTest {
-    @Test fun noTokenPersistsAndBlocksLaterTokensAndAcceptanceAfterRecreation() {
+    @Test fun noTokenIsSoftButArbitraryTokensCannotRestoreIt() {
         val preferences = MemoryPreferences()
         val decisions = ConfirmationDecisions(preferences)
         assertEquals(ConfirmationPreparation.NO_ATTRIBUTION, decisions.prepare(null))
-        assertTrue(preferences.getBoolean("decisionMade", false))
-        assertFalse(preferences.getBoolean("accepted", true))
+        assertTrue(preferences.getBoolean("noTokenAtLaunch", false))
+        assertFalse(preferences.getBoolean("accepted", false))
         val restarted = ConfirmationDecisions(MemoryPreferences(preferences.all))
-        assertEquals(ConfirmationPreparation.SKIP, restarted.prepare("later.token"))
-        assertEquals(ConfirmationPreparation.SKIP, restarted.prepare(null))
+        assertEquals(ConfirmationPreparation.NO_ATTRIBUTION, restarted.prepare("later.token"))
+        assertEquals(ConfirmationPreparation.NO_ATTRIBUTION, restarted.prepare(null))
         assertFalse(restarted.stage("later.token", "customer"))
     }
 
@@ -61,7 +61,7 @@ class ConfirmationDecisionsTest {
                 val restored = pool.submit<ConfirmationPreparation> { second.prepare(null) }
                 val didAccept = accepted.get(3, TimeUnit.SECONDS)
                 val restoration = restored.get(3, TimeUnit.SECONDS)
-                assertTrue(preferences.getBoolean("decisionMade", false))
+                assertEquals(didAccept, preferences.getBoolean("decisionMade", false))
                 assertEquals(didAccept, preferences.getBoolean("accepted", false))
                 assertEquals(if (didAccept) ConfirmationPreparation.SKIP else ConfirmationPreparation.NO_ATTRIBUTION, restoration)
                 assertEquals(if (didAccept) "accepted.token" else null, preferences.getString("pendingToken", null))
@@ -74,7 +74,7 @@ class ConfirmationDecisionsTest {
         for (tag in listOf("ko", "ko-KR", "ko-US")) {
             val copy = ConfirmationCopy(Locale.forLanguageTag(tag))
             assertEquals("이 소개로 시작할까요?", copy.title)
-            assertEquals("이 소개 링크를 결제 귀속에 사용합니다.", copy.message)
+            assertEquals("이 소개 링크를 결제 귀속에 사용합니다", copy.message)
             assertEquals("예", copy.yes)
             assertEquals("아니오", copy.no)
         }

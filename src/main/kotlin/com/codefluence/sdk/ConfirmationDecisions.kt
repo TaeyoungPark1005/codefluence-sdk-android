@@ -9,9 +9,18 @@ internal enum class ConfirmationPreparation { PRESENT, NO_ATTRIBUTION, SKIP }
 internal class ConfirmationDecisions(private val preferences: SharedPreferences) {
     fun prepare(token: String?): ConfirmationPreparation = synchronized(preferences) {
         if (hasDecision()) return@synchronized ConfirmationPreparation.SKIP
+        if (preferences.getBoolean("noTokenAtLaunch", false) && (token == null || token != preferences.getString("laterLinkToken", null))) return@synchronized ConfirmationPreparation.NO_ATTRIBUTION
         if (!token.isNullOrBlank()) return@synchronized ConfirmationPreparation.PRESENT
-        saveNoAttribution()
+        preferences.edit().putBoolean("noTokenAtLaunch", true).apply()
         ConfirmationPreparation.NO_ATTRIBUTION
+    }
+
+    fun acceptLink(token: String) = synchronized(preferences) {
+        if (!hasDecision()) {
+            val editor = preferences.edit().putString("clickToken", token)
+            if (preferences.getBoolean("noTokenAtLaunch", false)) editor.putString("laterLinkToken", token)
+            editor.apply()
+        }
     }
 
     fun stage(token: String, appUserId: String): Boolean = synchronized(preferences) {
@@ -20,6 +29,7 @@ internal class ConfirmationDecisions(private val preferences: SharedPreferences)
         val pendingToken = preferences.getString("pendingToken", null)
         val pendingCustomer = preferences.getString("pendingAppUserId", null)
         if ((pendingToken != null || pendingCustomer != null) && (pendingToken != token || pendingCustomer != appUserId)) return@synchronized false
+        if (preferences.getBoolean("noTokenAtLaunch", false) && pendingToken == null && token != preferences.getString("laterLinkToken", null)) return@synchronized false
         val editor = preferences.edit().putBoolean("decisionMade", true).putBoolean("accepted", true)
             .putString("pendingToken", token).putString("pendingAppUserId", appUserId)
         // A3: one idempotency key per queued confirmation, reused across retries.
@@ -27,6 +37,7 @@ internal class ConfirmationDecisions(private val preferences: SharedPreferences)
             editor.putString("pendingIdempotencyKey", java.util.UUID.randomUUID().toString())
             editor.putInt("pendingAttempts", 0)
         }
+        if (!preferences.contains("pendingLaunchKind")) editor.putString("pendingLaunchKind", if (preferences.getBoolean("noTokenAtLaunch", false)) "later" else "first_launch")
         editor.apply()
         true
     }
@@ -49,7 +60,7 @@ internal class ConfirmationDecisions(private val preferences: SharedPreferences)
 internal class ConfirmationCopy(locale: Locale) {
     private val korean = locale.language == "ko"
     val title = if (korean) "이 소개로 시작할까요?" else "Start with this referral?"
-    val message = if (korean) "이 소개 링크를 결제 귀속에 사용합니다." else "Use this referral link to attribute your purchases."
+    val message = if (korean) "이 소개 링크를 결제 귀속에 사용합니다" else "Use this referral link to attribute your purchases."
     val yes = if (korean) "예" else "Yes"
     val no = if (korean) "아니오" else "No"
 }

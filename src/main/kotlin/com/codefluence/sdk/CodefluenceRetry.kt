@@ -69,4 +69,8 @@ fun interface CodefluenceTransport {
         headers: Map<String, String>,
         body: String
     ): CodefluenceHttpResponse
+
+    /** GET without a body. Transports that cannot do it throw, so the caller fails closed (nothing is sent). */
+    fun get(url: String, headers: Map<String, String>): CodefluenceHttpResponse =
+        throw java.io.IOException("GET is not supported by this transport")
 }

@@ -28,7 +28,9 @@ class Codefluence private constructor(
     transport: CodefluenceTransport? = null,
     workExecutor: ((() -> Unit) -> Unit)? = null,
     mainExecutor: ((() -> Unit) -> Unit)? = null,
-    purchaseSource: PurchaseSource? = null
+    purchaseSource: PurchaseSource? = null,
+    integritySource: IntegrityTokenSource? = null,
+    clock: (() -> Long)? = null
 ) {
     private val purchaseSource: PurchaseSource? = purchaseSource ?: PlayBillingPurchaseSource.createIfAvailable(hostContext)
     data class Purchase(val purchaseToken: String, val products: List<String>, val obfuscatedAccountId: String? = null)
@@ -49,6 +51,46 @@ class Codefluence private constructor(
         workExecutor ?: { work -> realExecutor!!.execute(work) }
     private val mainExecutor: (() -> Unit) -> Unit =
         mainExecutor ?: { work -> mainHandler!!.post(work) }
+
+    // Daily activity signal (SPEC §29). Everything is gated by the server; with the feature off nothing leaves the device.
+    private val activitySignals = ActivitySignalClient(
+        preferences, this.transport, publicKey, apiHost,
+        integritySource ?: if (injectedPreferences == null) PlayIntegrityTokenSource.createIfAvailable(hostContext) else null,
+        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor
+    )
+
+    // Ad revenue reports (SPEC §26.2). Gated by the server the same way; with the feature off nothing leaves the device.
+    private val adRevenue = AdRevenueClient(
+        preferences, this.transport, publicKey, apiHost,
+        integritySource ?: if (injectedPreferences == null) PlayIntegrityTokenSource.createIfAvailable(hostContext) else null,
+        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor
+    )
+
+    /**
+     * Forwards one AdMob paid event. Call it from the paid event listener of every ad format:
+     * `ad.setOnPaidEventListener { value -> codefluence.reportAdRevenue(value.valueMicros, value.currencyCode, precision) }`
+     * where `precision` maps `AdValue.PrecisionType`. [CodefluenceAdValuePrecision.UNKNOWN] (for example test ads) counts the impression
+     * and adds no revenue. Values are summed on the device and sent at most once an hour; nothing leaves the device while the server
+     * has ad revenue turned off. Never throws.
+     */
+    fun reportAdRevenue(valueMicros: Long, currencyCode: String, precision: CodefluenceAdValuePrecision) = adRevenue.report(valueMicros, currencyCode, precision)
+
+    /** Sends the accumulated ad revenue batch if the server allows it and the hourly gate is open. Safe to call on every launch. */
+    fun flushAdRevenueIfNeeded(onResult: ((CodefluenceAdRevenueOutcome) -> Unit)? = null) = adRevenue.flushIfNeeded(onResult)
+
+    /**
+     * Records that the user reached a product milestone (for example `onboarded`). Names use letters, digits, `_`, `-` and `.`
+     * (up to 40 characters); anything else is ignored. The name is sent with the next attested daily signal and only when
+     * the campaign asks for milestones. Nothing leaves the device if the server has the feature turned off.
+     */
+    fun trackMilestone(name: String, onResult: ((CodefluenceActivitySignalOutcome) -> Unit)? = null) = activitySignals.trackMilestone(name, onResult)
+
+    /**
+     * Sends today's activity signal for the confirmed referral when the server has the feature on, Play Integrity is available and
+     * no signal was sent today (a new milestone allows one more). Safe to call on every launch and foreground; failures are
+     * returned as [CodefluenceActivitySignalOutcome.Skipped] and never thrown.
+     */
+    fun sendActivitySignalIfNeeded(onResult: ((CodefluenceActivitySignalOutcome) -> Unit)? = null) = activitySignals.sendIfNeeded(onResult)
 
     // A3 automatic retry dependencies. Defaults use real time/jitter/monitor;
     // tests inject deterministic values.
@@ -188,7 +230,7 @@ class Codefluence private constructor(
      */
     fun resume() {
         val id = appUserIdProvider.get()?.invoke()?.takeIf { it.isNotBlank() } ?: return
-        autoConfirmIfAvailable(id) { reportIfReferred() }
+        autoConfirmIfAvailable(id) { reportIfReferred(); if (preferences.contains("confirmedLeadId")) sendActivitySignalIfNeeded() }
     }
 
     /**
@@ -706,7 +748,7 @@ class Codefluence private constructor(
 
     companion object {
         /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
-        const val VERSION = "0.1.3"
+        const val VERSION = "0.2.0"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()
@@ -723,7 +765,9 @@ class Codefluence private constructor(
                 // accepted-but-unfinished confirmation.
                 it.startNetworkMonitorIfNeeded()
                 it.resumePendingConfirmationIfNeeded()
-                if (it.preferences.contains("confirmedLeadId")) it.reportPurchases()
+                if (it.preferences.contains("confirmedLeadId")) { it.reportPurchases(); it.sendActivitySignalIfNeeded() }
+                // Ad revenue forwarded earlier (paid events) is sent on launch too; the server gate decides whether anything leaves the device.
+                it.flushAdRevenueIfNeeded()
             }
         }
 
@@ -760,7 +804,9 @@ class Codefluence private constructor(
             transport: CodefluenceTransport,
             workExecutor: (() -> Unit) -> Unit = { it() },
             mainExecutor: (() -> Unit) -> Unit = { it() },
-            purchaseSource: PurchaseSource? = null
+            purchaseSource: PurchaseSource? = null,
+            integritySource: IntegrityTokenSource? = null,
+            clock: (() -> Long)? = null
         ): Codefluence = Codefluence(
             hostContext = null,
             publicKey = publicKey,
@@ -769,7 +815,9 @@ class Codefluence private constructor(
             transport = transport,
             workExecutor = workExecutor,
             mainExecutor = mainExecutor,
-            purchaseSource = purchaseSource
+            purchaseSource = purchaseSource,
+            integritySource = integritySource,
+            clock = clock
         )
     }
 }

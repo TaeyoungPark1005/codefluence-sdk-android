@@ -11,18 +11,22 @@ import java.net.URL
  * it as retryable.
  */
 internal class SystemHttpTransport : CodefluenceTransport {
-    override fun send(url: String, headers: Map<String, String>, body: String): CodefluenceHttpResponse {
+    override fun send(url: String, headers: Map<String, String>, body: String): CodefluenceHttpResponse = exchange(url, headers, body)
+
+    override fun get(url: String, headers: Map<String, String>): CodefluenceHttpResponse = exchange(url, headers, null)
+
+    private fun exchange(url: String, headers: Map<String, String>, body: String?): CodefluenceHttpResponse {
         var connection: HttpURLConnection? = null
         try {
             val request = (URL(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 5_000
                 readTimeout = 5_000
-                requestMethod = "POST"
-                doOutput = true
+                requestMethod = if (body == null) "GET" else "POST"
+                doOutput = body != null
                 headers.forEach { (name, value) -> setRequestProperty(name, value) }
             }
             connection = request
-            request.outputStream.use { it.write(body.toByteArray()) }
+            if (body != null) request.outputStream.use { it.write(body.toByteArray()) }
             val status = request.responseCode
             val stream = if (status in 200..299) request.inputStream else request.errorStream
             val text = stream?.bufferedReader()?.use { it.readText() } ?: ""

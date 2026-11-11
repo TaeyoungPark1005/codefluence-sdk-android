@@ -2,7 +2,7 @@
 
 Referral URLs are accepted only as `https://HOST/t/{token}`. Pass incoming deep links to `handleOpenURL(uri)`. Pass `purchaseAccountToken()` as `obfuscatedAccountId` when launching the billing flow so the purchase links back to the referral. Inject Play Integrity through `AttestationProvider` when calling `heartbeat` (aggregate once per day).
 
-minSdk 23, compileSdk 35의 로컬 Android 라이브러리입니다. Maven에 게시된 패키지가 아니며 공개 Codefluence artifact 좌표를 사용하지 않습니다. 공식 Play Install Referrer 클라이언트로 소개 토큰을 자동 복원하며 없으면 클립보드로 복원합니다. 권장 `autoConfirmIfAvailable`는 확인창 없이 `/track/confirm`을 호출하며 소개 코드 입력 UI는 없습니다. 기존 명시적 동의가 필요한 호스트는 `showConfirmationIfNeeded`를 사용할 수 있습니다.
+minSdk 23, compileSdk 35의 Android 라이브러리입니다. JitPack으로 게시되어 있습니다(아래 「설치」). 공식 Play Install Referrer 클라이언트로 소개 토큰을 자동 복원하며 없으면 클립보드로 복원합니다. 권장 `autoConfirmIfAvailable`는 확인창 없이 `/track/confirm`을 호출하며 소개 코드 입력 UI는 없습니다. 기존 명시적 동의가 필요한 호스트는 `showConfirmationIfNeeded`를 사용할 수 있습니다.
 
 ## 빠른 시작 (권장)
 
@@ -34,7 +34,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.1.3")
+    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.2.0")
 }
 ```
 
@@ -177,6 +177,41 @@ codefluence.subscriptionStatus { result ->
 ```
 
 `/track/confirm`에서 저장한 `leadId`와 `purchaseAccountToken`으로 `POST {apiHost}/track/subscription`(`Authorization: Bearer pk_...`)을 호출합니다. 저장값이 없으면 `NoSubscriptionReference`, 서버 404는 `SubscriptionNotFound`를 반환합니다. 저장된 confirm 응답 토큰이 없으면 로컬 `purchaseAccountToken`으로 대체합니다. 알 수 없는 event type은 `kind`가 `null`이고 `rawType`에 원문을 보존합니다.
+
+## 활동 신호와 `trackMilestone` (0.2.0)
+
+개발자 서버가 없는 앱의 활성 사용자 보상을 위해 SDK가 확인된 소개 설치에 묶인 **하루 한 번의 활동 신호**를 Play Integrity 증명과 함께 보냅니다(서버 계약 `docs/SPEC.md` §29).
+
+- **서버 플래그가 꺼져 있으면 아무것도 보내지 않습니다.** 먼저 `GET /track/signal-config`에 공개 키만 보내 기능 상태와 Cloud 프로젝트 번호를 받고(6시간 캐시), 켜져 있고 이 설치가 소개로 온 활성 보상 설치일 때만 challenge → Play Integrity 토큰 → 신호 순서로 보냅니다. `start`와 Activity 시작 때 자동으로 시도합니다.
+- 토큰은 Standard API의 `requestHash`에 `base64url(SHA-256(challenge + "\n" + 마일스톤))`을 묶어 요청합니다. 서버가 같은 값을 다시 계산해 대조합니다.
+- Play Integrity를 쓸 수 없거나 실패하면 보내지 않고 `Skipped(reason)`으로 끝납니다. 예외나 크래시는 없고 하루 시도는 3회로 제한합니다.
+- `codefluence.trackMilestone("onboarded")`: 캠페인이 정한 완료 행동 이름을 서명된 신호에 실어 보냅니다(영문자·숫자·`_ . -` 40자 이하).
+- 이 SDK는 `com.google.android.play:integrity`를 의존성으로 포함합니다. 앱은 Google Cloud에서 Play Integrity API를 켜고 Play Console에 연결해야 하며, 광고 ID는 쓰지 않습니다. Google Play 데이터 보안에 앱 사용 일수와 완료 행동 이름 수집(소개 설치에 연결, 추적 아님)을 반영하세요(항목별 표는 서버의 `/docs#store-privacy`).
+- 공식 문서: https://developer.android.com/google/play/integrity/standard
+
+## 광고 수익 보고 (`reportAdRevenue`, 0.2.0)
+
+광고 수익 보상 캠페인을 쓰는 앱은 AdMob의 노출 단위 수익(paid event) 값을 SDK로 넘깁니다. SDK가 기기에서 합산해 **한 시간에 한 번 이하**로 묶어 보냅니다(설계 `docs/SPEC.md` §26, 서버 계약 §26.2).
+
+```kotlin
+// 광고 형식마다 광고 객체를 받자마자, 보여 주기 전에 리스너를 붙입니다.
+ad.onPaidEventListener = OnPaidEventListener { adValue ->
+    val precision = when (adValue.precisionType) {
+        AdValue.PrecisionType.PRECISE -> CodefluenceAdValuePrecision.PRECISE
+        AdValue.PrecisionType.ESTIMATED -> CodefluenceAdValuePrecision.ESTIMATED
+        AdValue.PrecisionType.PUBLISHER_PROVIDED -> CodefluenceAdValuePrecision.PUBLISHER_PROVIDED
+        else -> CodefluenceAdValuePrecision.UNKNOWN
+    }
+    codefluence.reportAdRevenue(adValue.valueMicros, adValue.currencyCode, precision)
+}
+```
+
+- `UNKNOWN`(테스트 광고 등)은 노출 수만 세고 수익은 더하지 않습니다. 통화는 KRW·USD·JPY·EUR만 받고 그 밖의 값과 음수는 무시합니다.
+- **서버가 광고 수익을 켜기 전에는 아무것도 보내지 않습니다.** 먼저 `GET /track/signal-config`에 공개 키만 보내 `adRevenue: true`인지 묻고(6시간 캐시), 아니면 값은 기기에 남습니다.
+- 소개로 온 설치는 Play Integrity 증명과 함께 보냅니다. 증명의 요청 해시가 서버가 서명 대상으로 정한 `challenge\n통화,값,노출,미확정노출`을 덮으므로 값을 바꾸면 검증에 실패합니다. 증명이 통과한 값만 크리에이터 몫 계산에 쓰입니다. 소개 기간이 끝났거나 Play Integrity를 쓸 수 없는 환경에서는 **식별자 없이 합계만** 보내며 이 값은 지급 근거가 아니라 분모(앱 전체 SDK 합계)에만 쓰입니다.
+- 보내는 것은 금액(마이크로 단위)·통화·노출 수뿐입니다. 광고 ID(AAID)는 쓰지 않습니다. 429는 한 시간 쉬었다가 다시 보내고, 실패한 묶음은 기기에 남겨 다음에 보냅니다. 앱 시작 때도 남은 값을 보내며 예외나 크래시를 내지 않습니다.
+- Google Play 데이터 보안에 앱 광고 수익 금액 수집(소개 설치에 연결, 추적 아님)을 반영하세요.
+- 공식 문서: https://developers.google.com/admob/android/impression-level-ad-revenue (Google Mobile Ads SDK 21.1.0 이상, AdMob 화면에서 노출 단위 수익 켜기 필요)
 
 ## 빌드
 

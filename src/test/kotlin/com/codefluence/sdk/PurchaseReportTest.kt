@@ -30,6 +30,7 @@ class PurchaseReportTest {
         sdk(TestPreferences(mapOf("confirmedLeadId" to "lead-1", "confirmedPurchaseAccountToken" to "11111111-1111-4111-8111-111111111111")), transport).reportPurchases { count = it.getOrThrow() }
         assertEquals(2, count)
         assertEquals("token-1", bodies[0].getString("purchaseToken"))
+        assertEquals("release", bodies[0].getString("build"))
         assertEquals("pro", bodies[0].getString("productId"))
         assertEquals("product", bodies[0].getString("kind"))
         assertEquals("lead-1", bodies[0].getString("leadId"))

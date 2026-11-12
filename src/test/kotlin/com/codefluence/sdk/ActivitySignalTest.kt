@@ -84,7 +84,7 @@ class ActivitySignalTest {
         val signal = transport.requests[2].body!!
         assertEquals("play_integrity", signal.getJSONObject("proof").getString("type"))
         assertEquals("play-integrity-token-aaaaaaaa", signal.getJSONObject("proof").getString("token"))
-        assertEquals("lead-1", signal.getString("leadId")); assertEquals("token-1", signal.getString("purchaseAccountToken"))
+        assertEquals("lead-1", signal.getString("leadId")); assertEquals("token-1", signal.getString("purchaseAccountToken")); assertEquals("release", signal.getString("build"))
         assertEquals(0, signal.getJSONArray("milestones").length())
         clockMillis += 3_600_000
         assertEquals(CodefluenceActivitySignalOutcome.Skipped("already_sent_today"), send())
@@ -170,6 +170,6 @@ class ActivitySignalTest {
         assertTrue(ActivitySignalClient.validMilestone("first_post-1.0"))
         assertFalse(ActivitySignalClient.validMilestone("")); assertFalse(ActivitySignalClient.validMilestone("한글")); assertFalse(ActivitySignalClient.validMilestone("a b"))
         assertEquals("2026-09-22", ActivitySignalClient.kstDay(now))
-        assertEquals("0.2.0", Codefluence.VERSION)
+        assertEquals("0.2.1", Codefluence.VERSION)
     }
 }

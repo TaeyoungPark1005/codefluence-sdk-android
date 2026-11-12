@@ -32,7 +32,8 @@ internal class AdRevenueClient(
     private val integrity: IntegrityTokenSource?,
     private val clock: () -> Long,
     private val runOnWorker: (() -> Unit) -> Unit,
-    private val runOnMain: (() -> Unit) -> Unit
+    private val runOnMain: (() -> Unit) -> Unit,
+    private val build: String = "release"
 ) {
     private val inFlight = AtomicBoolean(false)
 
@@ -87,7 +88,8 @@ internal class AdRevenueClient(
     private fun headers() = mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json")
 
     private fun post(path: String, body: JSONObject): Pair<Int, JSONObject> {
-        val response = transport.send("$apiHost/$path", headers(), body.toString())
+        // 신호·증명·광고 수익 요청에도 빌드 종류를 싣는다. 서버는 개발 빌드를 운영 집계에서 뺀다.
+        val response = transport.send("$apiHost/$path", headers(), body.put("build", build).toString())
         return response.status to (runCatching { JSONObject(response.body) }.getOrNull() ?: JSONObject())
     }
 

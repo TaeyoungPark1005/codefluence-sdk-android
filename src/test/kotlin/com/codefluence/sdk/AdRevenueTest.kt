@@ -85,7 +85,8 @@ class AdRevenueTest {
         assertEquals(CodefluenceAdRevenueOutcome.Sent(false), flush())
         assertEquals(listOf("/track/signal-config", "/track/ad-revenue"), transport.paths())
         val body = transport.requests[1].body!!
-        assertEquals(setOf("report"), body.keys().asSequence().toSet())
+        assertEquals(setOf("report", "build"), body.keys().asSequence().toSet())
+        assertEquals("release", body.getString("build"))
         val report = body.getJSONObject("report")
         assertEquals("USD", report.getString("currency")); assertEquals(1_500_000L, report.getLong("valueMicros"))
         assertEquals(2, report.getInt("impressions")); assertEquals(1, report.getInt("unknownImpressions"))
@@ -99,7 +100,7 @@ class AdRevenueTest {
         // The integrity request hash covers `challenge\ncurrency,micros,impressions,unknown`, the string the server rebuilds.
         assertEquals(123456789012L to ActivitySignalClient.requestHash("challenge-abc\nUSD,1500000,2,1"), integrity.calls.single())
         val sent = transport.requests.last().body!!
-        assertEquals("lead-1", sent.getString("leadId")); assertEquals("token-1", sent.getString("purchaseAccountToken"))
+        assertEquals("lead-1", sent.getString("leadId")); assertEquals("token-1", sent.getString("purchaseAccountToken")); assertEquals("release", sent.getString("build"))
         assertEquals("play_integrity", sent.getJSONObject("proof").getString("type"))
         assertEquals("ad_revenue", transport.requests.first { it.path == "/track/signal-challenge" }.body!!.getString("purpose"))
     }

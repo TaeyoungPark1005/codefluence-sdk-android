@@ -28,7 +28,7 @@ class ValidateTest {
     @Test fun healthySetupPassesEveryCheck() {
         val transport = status(200)
         val checks = validate(sdk(transport = transport), "adledger")
-        assertEquals(listOf("설정", "서버와 키", "URL 스킴"), checks.map { it.name })
+        assertEquals(listOf("설정", "서버와 키", "빌드", "URL 스킴"), checks.map { it.name })
         assertTrue(checks.toString(), checks.all { it.passed })
         assertEquals("점검이 첫 신호로도 도착해야 한다", 1, transport.captured.count { it.url.endsWith("/sdk/heartbeat") })
     }

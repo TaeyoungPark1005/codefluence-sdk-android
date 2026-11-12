@@ -29,6 +29,7 @@ class TouchTest {
         assertEquals(tokenB, body.getString("clickToken"))
         assertEquals("user-1", body.getString("appUserId"))
         assertEquals(install, body.getString("purchaseAccountToken"))
+        assertEquals("release", body.getString("build"))
         assertEquals("첫 소개 토큰은 바뀌지 않는다", tokenA, preferences.getString("clickToken", null))
     }
 

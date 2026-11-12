@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -30,11 +31,20 @@ class Codefluence private constructor(
     mainExecutor: ((() -> Unit) -> Unit)? = null,
     purchaseSource: PurchaseSource? = null,
     integritySource: IntegrityTokenSource? = null,
-    clock: (() -> Long)? = null
+    clock: (() -> Long)? = null,
+    debuggable: Boolean? = null
 ) {
     private val purchaseSource: PurchaseSource? = purchaseSource ?: PlayBillingPurchaseSource.createIfAvailable(hostContext)
     data class Purchase(val purchaseToken: String, val products: List<String>, val obfuscatedAccountId: String? = null)
     private val context = hostContext?.applicationContext
+
+    /**
+     * 이 빌드의 종류(`"debug"` 또는 `"release"`). 모든 서버 요청의 `build` 필드로 실린다.
+     * 호스트 앱이 디버그 가능(`ApplicationInfo.FLAG_DEBUGGABLE`, 보통 debug 빌드 타입)이면 `"debug"`다.
+     * 에뮬레이터는 판정하지 않는다(오탐으로 실사용자를 개발 빌드로 분류하지 않게). 서버는 `"debug"` 신호를
+     * 설치 점검에만 보여 주고 운영 집계·보상에서 뺀다(sandbox). 테스트 구매는 Play 응답으로 따로 판정한다.
+     */
+    val build: String = if (debuggable ?: ((context?.applicationInfo?.flags ?: 0) and ApplicationInfo.FLAG_DEBUGGABLE != 0)) "debug" else "release"
     private val activityReference = (hostContext as? Activity)?.let { WeakReference(it) }
     private val preferences: SharedPreferences = injectedPreferences
         ?: requireNotNull(context) { "A Context is required without injected preferences" }
@@ -56,14 +66,14 @@ class Codefluence private constructor(
     private val activitySignals = ActivitySignalClient(
         preferences, this.transport, publicKey, apiHost,
         integritySource ?: if (injectedPreferences == null) PlayIntegrityTokenSource.createIfAvailable(hostContext) else null,
-        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor
+        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor, build
     )
 
     // Ad revenue reports (SPEC §26.2). Gated by the server the same way; with the feature off nothing leaves the device.
     private val adRevenue = AdRevenueClient(
         preferences, this.transport, publicKey, apiHost,
         integritySource ?: if (injectedPreferences == null) PlayIntegrityTokenSource.createIfAvailable(hostContext) else null,
-        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor
+        clock ?: { System.currentTimeMillis() }, this.workExecutor, this.mainExecutor, build
     )
 
     /**
@@ -215,7 +225,7 @@ class Codefluence private constructor(
         workExecutor {
             val status = runCatching {
                 transport.send("$apiHost/track/touch", mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json"),
-                    JSONObject().put("clickToken", token).put("appUserId", appUserId).put("purchaseAccountToken", installToken).toString()).status
+                    JSONObject().put("clickToken", token).put("appUserId", appUserId).put("purchaseAccountToken", installToken).put("build", build).toString()).status
             }.getOrNull()
             if (status != null && (status in 200..299 || status in setOf(400, 401, 403, 404, 409, 422))) {
                 preferences.edit().putString("touchedTokens", org.json.JSONArray((reported + token).takeLast(20)).toString()).apply()
@@ -271,7 +281,7 @@ class Codefluence private constructor(
         if (!publicKey.startsWith("pk_")) { onResult(Result.failure(CodefluenceError.NotConfigured)); return }
         workExecutor { val result = runCatching {
             val connection = (URL("$apiHost/track/purchase").openConnection() as HttpURLConnection).apply { connectTimeout = 5_000; readTimeout = 5_000; requestMethod = "POST"; doOutput = true; setRequestProperty("Authorization", "Bearer $publicKey"); setRequestProperty("Content-Type", "application/json") }
-            val body = JSONObject().apply { put("purchaseToken", purchase.purchaseToken); put("productId", purchase.products.firstOrNull() ?: error("products is empty")); purchase.obfuscatedAccountId?.let { put("appUserId", it) }; put("kind", if (isSubscription) "subscription" else "product") }
+            val body = JSONObject().apply { put("purchaseToken", purchase.purchaseToken); put("productId", purchase.products.firstOrNull() ?: error("products is empty")); purchase.obfuscatedAccountId?.let { put("appUserId", it) }; put("kind", if (isSubscription) "subscription" else "product"); put("build", build) }
             connection.outputStream.use { it.write(body.toString().toByteArray()) }
             if (connection.responseCode !in 200..299) error("Codefluence purchase report failed: ${connection.responseCode}")
             connection.disconnect(); Unit
@@ -309,6 +319,7 @@ class Codefluence private constructor(
                     put("purchaseToken", purchase.purchaseToken); put("productId", purchase.productId)
                     put("kind", if (purchase.subscription) "subscription" else "product")
                     leadId?.let { put("leadId", it) }; token?.let { put("purchaseAccountToken", it) }
+                    put("build", build)
                 }
                 runCatching { transport.send("$apiHost/track/purchase", mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json"), body.toString()).status.also { android.util.Log.i("Codefluence", "purchase report answered HTTP $it") } in 200..299 }.onFailure { android.util.Log.w("Codefluence", "purchase report request failed: ${it.javaClass.simpleName}") }.getOrDefault(false)
             }.map { it.purchaseToken }
@@ -344,7 +355,7 @@ class Codefluence private constructor(
 
     /** 서버가 받는 계약 그대로 보냅니다: `platform`은 필수이고, 증명이 없으면 `attestation` 키를 뺍니다. */
     private fun postHeartbeat(appVersion: String, sdkVersion: String, attestation: String?): Int {
-        val body = JSONObject().put("platform", "android").put("appVersion", appVersion).put("sdkVersion", sdkVersion)
+        val body = JSONObject().put("platform", "android").put("appVersion", appVersion).put("sdkVersion", sdkVersion).put("build", build)
         if (attestation != null) body.put("attestation", attestation)
         val headers = mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json")
         return transport.send("$apiHost/sdk/heartbeat", headers, body.toString()).status
@@ -378,6 +389,7 @@ class Codefluence private constructor(
             else -> CodefluenceCheck("설정", false, "pk_ 공개 키와 서버 주소(https://…)를 start 또는 configure에 넣으세요. BuildConfig 값이 비어 있지 않은지 확인하세요")
         }
         val finish: () -> Unit = {
+            checks += buildCheck(build)
             if (urlScheme != null) {
                 val registered = schemeRegistered(urlScheme)
                 checks += CodefluenceCheck("URL 스킴", registered, if (registered) "$urlScheme:// 스킴이 앱에 등록돼 있어요"
@@ -401,6 +413,11 @@ class Codefluence private constructor(
             finish()
         }
     }
+
+    /** 설치 점검의 「빌드」 항목. 개발 빌드의 신호는 서버가 운영 집계·보상에서 빼므로 그 사실을 알려 준다(통과·실패가 아니라 안내). */
+    internal fun buildCheck(build: String): CodefluenceCheck = if (build == "debug")
+        CodefluenceCheck("빌드", true, "개발 빌드(디버그 가능 빌드)로 표시돼요. 이 빌드의 신호·확인·결제는 대시보드에 「개발 빌드에서 확인됨」으로만 보이고 운영 집계와 보상에는 들어가지 않아요")
+    else CodefluenceCheck("빌드", true, "출시 빌드로 표시돼요. 이 빌드의 신호는 운영 집계에 들어가요")
 
     private fun looksLikeSignedToken(value: String): Boolean = value.matches(Regex("^[^./?#]+\\.[^./?#]+\\.[0-9]+\\.[A-Za-z0-9_-]+$"))
 
@@ -655,6 +672,7 @@ class Codefluence private constructor(
                 val body = JSONObject(mapOf("clickToken" to token, "appUserId" to appUserId))
                 body.put("launchKind", preferences.getString("pendingLaunchKind", "first_launch"))
                 body.put("purchaseAccountToken", purchaseAccountToken())
+                body.put("build", build)
                 val response = transport.send("$apiHost/track/confirm", headers, body.toString())
                 if (response.status !in 200..299) {
                     failureClass = ConfirmationFailureClass.forStatus(response.status)
@@ -748,7 +766,7 @@ class Codefluence private constructor(
 
     companion object {
         /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
-        const val VERSION = "0.2.0"
+        const val VERSION = "0.2.1"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()
@@ -806,7 +824,8 @@ class Codefluence private constructor(
             mainExecutor: (() -> Unit) -> Unit = { it() },
             purchaseSource: PurchaseSource? = null,
             integritySource: IntegrityTokenSource? = null,
-            clock: (() -> Long)? = null
+            clock: (() -> Long)? = null,
+            debuggable: Boolean? = null
         ): Codefluence = Codefluence(
             hostContext = null,
             publicKey = publicKey,
@@ -817,7 +836,8 @@ class Codefluence private constructor(
             mainExecutor = mainExecutor,
             purchaseSource = purchaseSource,
             integritySource = integritySource,
-            clock = clock
+            clock = clock,
+            debuggable = debuggable
         )
     }
 }

@@ -32,11 +32,21 @@ class Codefluence private constructor(
     purchaseSource: PurchaseSource? = null,
     integritySource: IntegrityTokenSource? = null,
     clock: (() -> Long)? = null,
-    debuggable: Boolean? = null
+    debuggable: Boolean? = null,
+    purchaseQueueStore: PurchaseQueueStore? = null
 ) {
     private val purchaseSource: PurchaseSource? = purchaseSource ?: PlayBillingPurchaseSource.createIfAvailable(hostContext)
     data class Purchase(val purchaseToken: String, val products: List<String>, val obfuscatedAccountId: String? = null)
     private val context = hostContext?.applicationContext
+    /** 미전송 구매 큐(0.2.2). 앱에서는 `noBackupFilesDir`의 파일이라 자동 백업·기기 이전으로 복제되지 않는다. */
+    private val purchaseQueue: PurchaseQueueStore = purchaseQueueStore
+        ?: context?.let { FilePurchaseQueueStore(java.io.File(it.noBackupFilesDir, "codefluence-purchase-queue.json")) }
+        ?: InMemoryPurchaseQueueStore()
+    private val queueLock = Any()
+    private val purchaseNow: () -> Long = clock ?: { System.currentTimeMillis() }
+    private val purchaseFlushInFlight = AtomicBoolean(false)
+    private val purchaseFlushAgain = AtomicBoolean(false)
+    private val purchaseRetryScheduled = AtomicBoolean(false)
 
     /**
      * 이 빌드의 종류(`"debug"` 또는 `"release"`). 모든 서버 요청의 `build` 필드로 실린다.
@@ -124,9 +134,9 @@ class Codefluence private constructor(
         monitor?.let { networkMonitor = it; monitorStarted.set(false) }
     }
 
-    private fun startNetworkMonitorIfNeeded() {
+    internal fun startNetworkMonitorIfNeeded() {
         if (monitorStarted.compareAndSet(false, true)) {
-            networkMonitor?.start { resumePendingConfirmationIfNeeded() }
+            networkMonitor?.start { resumePendingConfirmationIfNeeded(); flushPurchaseQueue() }
         }
     }
 
@@ -250,6 +260,23 @@ class Codefluence private constructor(
      */
     fun purchaseCompleted() = reportIfReferred()
 
+    /**
+     * 결제 직후 구매를 직접 넘긴다(0.2.2). 소모성 상품을 소비(consume)하기 **전에** 부르면 좋고, 소비 뒤에 불러도 된다:
+     * SDK는 토큰을 받은 즉시 기기에 저장하고 보내며, 서버가 받을 때까지(네트워크 오류·서버 오류·결제 조회 키 미등록)
+     * 앱 시작·전면 전환·네트워크 복구 때 다시 보낸다. 소비된 구매는 `queryPurchasesAsync`에 나오지 않으므로,
+     * 다른 결제 SDK(RevenueCat 등)를 쓰는 앱은 결제 완료 콜백에서 이 호출을 써야 소모성 결제가 빠지지 않는다.
+     * 소개로 온 설치(확인 완료 또는 확인 대기)에서만 저장하고, 소개와 무관한 설치는 아무것도 저장·전송하지 않는다.
+     * [onResult]는 이번에 서버가 받아들인 구매 수다(메인 스레드).
+     */
+    @JvmOverloads
+    fun purchaseCompleted(purchaseToken: String, productId: String, isSubscription: Boolean, orderId: String? = null, onResult: (Result<Int>) -> Unit = {}) {
+        if (purchaseToken.isBlank() || productId.isBlank() ||
+            !enqueuePurchases(listOf(QueuedPurchase(purchaseToken, productId, isSubscription, orderId?.takeIf { it.isNotBlank() }, purchaseNow())))) {
+            mainExecutor { onResult(Result.success(0)) }; return
+        }
+        flushPurchaseQueue(onResult)
+    }
+
     private fun reportIfReferred() {
         if (preferences.contains("confirmedLeadId")) reportPurchases()
     }
@@ -276,17 +303,26 @@ class Codefluence private constructor(
         }
     }
 
-    /** Reports a verified Google Play purchase token; price and state are read server-side. */
+    /**
+     * Reports a verified Google Play purchase token; price and state are read server-side.
+     * 0.2.2: 소개로 온 설치면 [purchaseCompleted]와 같은 큐를 거치고(실패해도 기기에 남아 다시 보내진다), 본문에 확인된 lead와 설치 토큰을 싣는다.
+     */
     fun reportPurchase(purchase: Purchase, isSubscription: Boolean = false, onResult: (Result<Unit>) -> Unit = {}) {
         if (!publicKey.startsWith("pk_")) { onResult(Result.failure(CodefluenceError.NotConfigured)); return }
-        workExecutor { val result = runCatching {
-            val connection = (URL("$apiHost/track/purchase").openConnection() as HttpURLConnection).apply { connectTimeout = 5_000; readTimeout = 5_000; requestMethod = "POST"; doOutput = true; setRequestProperty("Authorization", "Bearer $publicKey"); setRequestProperty("Content-Type", "application/json") }
-            val body = JSONObject().apply { put("purchaseToken", purchase.purchaseToken); put("productId", purchase.products.firstOrNull() ?: error("products is empty")); purchase.obfuscatedAccountId?.let { put("appUserId", it) }; put("kind", if (isSubscription) "subscription" else "product"); put("build", build) }
-            connection.outputStream.use { it.write(body.toString().toByteArray()) }
-            if (connection.responseCode !in 200..299) error("Codefluence purchase report failed: ${connection.responseCode}")
-            connection.disconnect(); Unit
+        val productId = purchase.products.firstOrNull()
+        if (productId.isNullOrBlank() || purchase.purchaseToken.isBlank()) { mainExecutor { onResult(Result.failure(CodefluenceError.RequestFailed("products is empty"))) }; return }
+        val record = QueuedPurchase(purchase.purchaseToken, productId, isSubscription, null, purchaseNow())
+        if (enqueuePurchases(listOf(record))) {
+            flushPurchaseQueue { _ ->
+                onResult(if (purchase.purchaseToken in reportedPurchaseTokens()) Result.success(Unit) else Result.failure(CodefluenceError.RequestFailed("Codefluence purchase report failed")))
+            }
+            return
         }
-        mainExecutor { onResult(result) } }
+        workExecutor {
+            val status = sendPurchase(record)
+            val result = if (status in 200..299) Result.success(Unit) else Result.failure(CodefluenceError.RequestFailed("Codefluence purchase report failed: $status"))
+            mainExecutor { onResult(result) }
+        }
     }
 
     /**
@@ -297,7 +333,8 @@ class Codefluence private constructor(
      */
     fun reportPurchases(onResult: (Result<Int>) -> Unit = {}) {
         if (!publicKey.startsWith("pk_")) { mainExecutor { onResult(Result.failure(CodefluenceError.NotConfigured)) }; return }
-        val source = purchaseSource ?: run { mainExecutor { onResult(Result.success(0)) }; return }
+        // Play Billing이 없어도 큐에 남은 구매는 보낸다.
+        val source = purchaseSource ?: run { flushPurchaseQueue(onResult); return }
         // One report at a time; overlapping calls (launch, confirm, purchase callback) return 0.
         if (!reportInFlight.compareAndSet(false, true)) { mainExecutor { onResult(Result.success(0)) }; return }
         // Play Billing can fail to call back (service busy or unavailable). Without a deadline the in-flight
@@ -312,15 +349,17 @@ class Codefluence private constructor(
             if (finished.get()) return@workExecutor
             val reported = reportedPurchaseTokens()
             android.util.Log.i("Codefluence", "purchase lookup returned ${owned.size} purchase(s), ${owned.count { it.purchaseToken in reported }} already reported")
+            if (isReferralInstall()) {
+                // 소개로 온 설치: 먼저 기기 큐에 넣고 보낸다. 서버가 받지 못한 구매는 소비돼 목록에서 사라져도 다시 보내진다.
+                enqueuePurchases(owned.filter { it.purchaseToken !in reported }.map { QueuedPurchase(it.purchaseToken, it.productId, it.subscription, null, purchaseNow()) })
+                finish(Result.success(drainPurchaseQueue()))
+                return@workExecutor
+            }
+            // 소개와 무관한 설치(또는 직접 부른 경우): 큐에 넣지 않고 예전처럼 한 번씩만 보낸다.
             val leadId = preferences.getString("confirmedLeadId", null)
             val token = leadId?.let { preferences.getString("confirmedPurchaseAccountToken", null) ?: purchaseAccountToken() }
             val accepted = owned.filter { it.purchaseToken !in reported }.filter { purchase ->
-                val body = JSONObject().apply {
-                    put("purchaseToken", purchase.purchaseToken); put("productId", purchase.productId)
-                    put("kind", if (purchase.subscription) "subscription" else "product")
-                    leadId?.let { put("leadId", it) }; token?.let { put("purchaseAccountToken", it) }
-                    put("build", build)
-                }
+                val body = purchaseBody(purchase.purchaseToken, purchase.productId, purchase.subscription, leadId, token, build)
                 runCatching { transport.send("$apiHost/track/purchase", mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json"), body.toString()).status.also { android.util.Log.i("Codefluence", "purchase report answered HTTP $it") } in 200..299 }.onFailure { android.util.Log.w("Codefluence", "purchase report request failed: ${it.javaClass.simpleName}") }.getOrDefault(false)
             }.map { it.purchaseToken }
             if (accepted.isNotEmpty()) preferences.edit().putString("reportedPurchaseTokens", org.json.JSONArray((reported + accepted).takeLast(200)).toString()).apply()
@@ -331,6 +370,109 @@ class Codefluence private constructor(
 
     private val reportInFlight = AtomicBoolean(false)
     private val PURCHASE_LOOKUP_TIMEOUT_MS = 20_000L
+
+    // ---- 미전송 구매 큐 (0.2.2) ------------------------------------------------------------
+
+    /** 확인이 끝났거나, 받아들인 확인이 아직 서버에 닿지 않은 설치. */
+    internal fun isReferralInstall(): Boolean = preferences.contains("confirmedLeadId") ||
+        (preferences.getBoolean("accepted", false) && !preferences.getString("pendingToken", null).isNullOrBlank())
+
+    /** 지금 큐에 있는 구매. 테스트와 진단용. */
+    internal fun queuedPurchases(): List<QueuedPurchase> = synchronized(queueLock) { purchaseQueue.load() }
+
+    /** 소개로 온 설치면 구매를 큐에 넣고 true. 아니면 아무것도 저장하지 않고 false. */
+    private fun enqueuePurchases(purchases: List<QueuedPurchase>): Boolean {
+        if (!isReferralInstall()) return false
+        synchronized(queueLock) {
+            val now = purchaseNow()
+            val reported = reportedPurchaseTokens().toSet()
+            var records = purchaseQueue.load()
+            purchases.forEach { records = PurchaseQueueRules.enqueue(records, it, now, reported) }
+            purchaseQueue.save(PurchaseQueueRules.pruned(records, now))
+        }
+        return true
+    }
+
+    /** 보낼 때가 된 큐의 구매를 백그라운드에서 보낸다. 앱 시작·전면 전환(`reportPurchases`)·네트워크 복구·예약된 재시도·결제 직후에 돈다. */
+    internal fun flushPurchaseQueue(onResult: (Result<Int>) -> Unit = {}) {
+        if (!publicKey.startsWith("pk_")) { mainExecutor { onResult(Result.failure(CodefluenceError.NotConfigured)) }; return }
+        workExecutor { val count = drainPurchaseQueue(); mainExecutor { onResult(Result.success(count)) } }
+    }
+
+    /**
+     * 작업 스레드에서 큐를 한 번 비운다. 확인이 끝나기 전에는 보내지 않고 기다리며, 소개가 사라졌으면(거절·영구 실패) 큐를 지운다.
+     * 이미 도는 중이면 끝난 뒤 한 번 더 돌게 표시하고 0을 돌려준다.
+     */
+    private fun drainPurchaseQueue(): Int {
+        if (!purchaseFlushInFlight.compareAndSet(false, true)) { purchaseFlushAgain.set(true); return 0 }
+        var accepted = 0
+        try {
+            do {
+                purchaseFlushAgain.set(false)
+                val now = purchaseNow()
+                val due = synchronized(queueLock) {
+                    val records = if (isReferralInstall()) PurchaseQueueRules.pruned(purchaseQueue.load(), now) else emptyList()
+                    purchaseQueue.save(records)
+                    if (preferences.contains("confirmedLeadId")) records.filter { it.nextAttemptAt <= now } else emptyList()
+                }
+                for (record in due) {
+                    val outcome = PurchaseReportOutcome.forStatus(sendPurchase(record))
+                    if (outcome == PurchaseReportOutcome.ACCEPTED) accepted++
+                    applyPurchaseOutcome(outcome, record.purchaseToken)
+                }
+            } while (purchaseFlushAgain.get())
+        } finally {
+            purchaseFlushInFlight.set(false)
+        }
+        schedulePurchaseRetryIfNeeded()
+        return accepted
+    }
+
+    private fun applyPurchaseOutcome(outcome: PurchaseReportOutcome, purchaseToken: String) {
+        synchronized(queueLock) {
+            val now = purchaseNow()
+            val records = purchaseQueue.load().mapNotNull { record ->
+                when {
+                    record.purchaseToken != purchaseToken -> record
+                    outcome == PurchaseReportOutcome.ACCEPTED || outcome == PurchaseReportOutcome.DROP -> null
+                    else -> (record.attempts + 1).let { attempts ->
+                        record.copy(attempts = attempts, nextAttemptAt = PurchaseQueueRules.nextAttempt(outcome, attempts, now, jitterProvider()))
+                    }
+                }
+            }
+            purchaseQueue.save(records)
+            if (outcome == PurchaseReportOutcome.ACCEPTED) {
+                preferences.edit().putString("reportedPurchaseTokens", org.json.JSONArray((reportedPurchaseTokens() + purchaseToken).takeLast(200)).toString()).apply()
+            }
+        }
+    }
+
+    /** 이번 실행 안에서 가장 이른 다음 시도에 맞춰 한 번 더 비운다. 앱이 그 전에 꺼지면 다음 시작이 이어 받는다. */
+    private fun schedulePurchaseRetryIfNeeded() {
+        if (!preferences.contains("confirmedLeadId")) return
+        val next = synchronized(queueLock) { purchaseQueue.load().minOfOrNull { it.nextAttemptAt } } ?: return
+        if (!purchaseRetryScheduled.compareAndSet(false, true)) return
+        scheduler((next - purchaseNow()).coerceAtLeast(0)) { purchaseRetryScheduled.set(false); flushPurchaseQueue() }
+    }
+
+    /** 구매 보고 한 건. 본문은 스토어 목록 보고와 같다: 토큰·상품 ID·종류·확인된 lead와 설치 토큰(있으면)·`build`. HTTP 상태, 응답이 없으면 null. */
+    private fun sendPurchase(record: QueuedPurchase): Int? {
+        val leadId = preferences.getString("confirmedLeadId", null)
+        val token = leadId?.let { preferences.getString("confirmedPurchaseAccountToken", null) ?: purchaseAccountToken() }
+        val body = purchaseBody(record.purchaseToken, record.productId, record.subscription, leadId, token, build)
+        return runCatching {
+            transport.send("$apiHost/track/purchase", mapOf("Authorization" to "Bearer $publicKey", "Content-Type" to "application/json"), body.toString()).status
+                .also { android.util.Log.i("Codefluence", "purchase report answered HTTP $it") }
+        }.onFailure { android.util.Log.w("Codefluence", "purchase report request failed: ${it.javaClass.simpleName}") }.getOrNull()
+    }
+
+    internal fun purchaseBody(purchaseToken: String, productId: String, subscription: Boolean, leadId: String?, purchaseAccountToken: String?, build: String): JSONObject =
+        JSONObject().apply {
+            put("purchaseToken", purchaseToken); put("productId", productId)
+            put("kind", if (subscription) "subscription" else "product")
+            leadId?.let { put("leadId", it) }; purchaseAccountToken?.let { put("purchaseAccountToken", it) }
+            put("build", build)
+        }
 
     private fun reportedPurchaseTokens(): List<String> = runCatching {
         val array = org.json.JSONArray(preferences.getString("reportedPurchaseTokens", "[]"))
@@ -766,7 +908,7 @@ class Codefluence private constructor(
 
     companion object {
         /** SDK 버전. heartbeat가 서버에 보내 앱 버전별 신호 표에 나타납니다. */
-        const val VERSION = "0.2.1"
+        const val VERSION = "0.2.2"
         private val gate = ConfirmationGate()
         fun configure(context: Context, publicKey: String, apiHost: String): Codefluence {
             val normalizedKey = publicKey.trim()
@@ -825,7 +967,8 @@ class Codefluence private constructor(
             purchaseSource: PurchaseSource? = null,
             integritySource: IntegrityTokenSource? = null,
             clock: (() -> Long)? = null,
-            debuggable: Boolean? = null
+            debuggable: Boolean? = null,
+            purchaseQueueStore: PurchaseQueueStore? = null
         ): Codefluence = Codefluence(
             hostContext = null,
             publicKey = publicKey,
@@ -837,7 +980,8 @@ class Codefluence private constructor(
             purchaseSource = purchaseSource,
             integritySource = integritySource,
             clock = clock,
-            debuggable = debuggable
+            debuggable = debuggable,
+            purchaseQueueStore = purchaseQueueStore ?: InMemoryPurchaseQueueStore()
         )
     }
 }

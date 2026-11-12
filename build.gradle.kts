@@ -6,7 +6,7 @@ plugins {
 
 // 게시 좌표는 확정 전이다(docs/SDK-PUBLISHING.md). 기본값은 로컬 검증용이며 -Pcodefluence.group 등으로 바꾼다.
 group = (findProperty("codefluence.group") as String?) ?: "io.jocoding.codefluence"
-version = (findProperty("codefluence.version") as String?) ?: "0.2.1"
+version = (findProperty("codefluence.version") as String?) ?: "0.2.2"
 
 android {
     namespace = "com.codefluence.sdk"

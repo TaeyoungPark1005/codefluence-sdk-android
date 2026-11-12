@@ -15,6 +15,10 @@ codefluence.handle(intent)
 
 codefluence.resume()            // 사용자 ID가 뒤늦게 정해졌을 때
 codefluence.purchaseCompleted() // 결제가 끝났을 때(어떤 구매 SDK든)
+
+// 0.2.2 권장: 결제 직후 구매를 직접 넘깁니다(소비된 소모성 결제가 빠지지 않습니다. 아래 「미전송 구매 큐」).
+codefluence.purchaseCompleted(purchase, isSubscription = false)   // Play Billing `Purchase`
+codefluence.purchaseCompleted(tx.purchaseToken, tx.productIds.first(), tx.type == ProductType.SUBS, tx.orderId) // RevenueCat
 ```
 
 `start`는 `configure`를 부르고, 딥링크가 사용자 ID보다 먼저·나중에 와도 토큰을 보관했다가 ID가 정해지면 확인합니다. 시작 직후 소개 링크가 없다는 판단(귀속 없음 확정)은 1초 유예 뒤에 하며, Activity가 시작될 때마다 `resume()`을 자동으로 부릅니다. `purchaseCompleted()`는 소개로 온 설치에서만 결제를 보고합니다. 앱 URL 스킴 intent-filter는 호스트 앱이 등록하고 대시보드 제품 화면의 「앱 열기 스킴」에도 같은 값을 저장하세요. 아래 개별 호출은 세밀한 제어가 필요할 때만 씁니다.
@@ -34,7 +38,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.2.1")
+    implementation("com.github.TaeyoungPark1005:codefluence-sdk-android:0.2.2")
 }
 ```
 
@@ -236,9 +240,54 @@ JVM 단위 테스트는 실제 SDK가 사용하는 저장 결정 로직에 메�
 RevenueCat 등 어떤 결제 SDK로 결제했든, 결제 성공 콜백에서 `codefluence.reportPurchases()`를 부르면 SDK가 자체 `BillingClient`로 INAPP·SUBS 구매를 읽어 아직 보고하지 않은 구매 토큰을 확인된 소개 정보(`leadId`, 설치 토큰)와 함께 `/track/purchase`로 보냅니다. 서버는 Google Play Developer API로 구매를 검증한 뒤 연결합니다. 앱 시작과 소개 확인 직후에도 자동으로 돕니다.
 
 - Play Billing 라이브러리는 `compileOnly`이며 **7.x 이상**을 지원합니다. 인앱 결제를 파는 앱은 이미 포함하고 있으며, 없거나 6.x 이하면 보고를 건너뜁니다(앱을 멈추지 않습니다).
-- Google은 활성 구독과 소모하지 않은 일회성 구매만 돌려줍니다. 소모성 상품은 결제 성공 콜백에서 반드시 호출하세요.
+- Google은 활성 구독과 소모하지 않은 일회성 구매만 돌려줍니다. 소모성 상품은 결제 성공 콜백에서 구매를 직접 넘기세요(아래 「미전송 구매 큐」).
 - iOS와 달리 서명된 계정 값이 없어, "이 기기의 구매"라는 연결은 SDK 보고에 기댑니다(SPEC §25.2 `reported_token`).
 - 근거 문서: https://developer.android.com/reference/com/android/billingclient/api/BillingClient#queryPurchasesAsync(com.android.billingclient.api.QueryPurchasesParams,com.android.billingclient.api.PurchasesResponseListener)
+
+## 미전송 구매 큐 (0.2.2)
+
+0.2.1까지는 보내지 못한 구매를 기기에 저장하지 않고 다음 실행 때 `queryPurchasesAsync`를 다시 읽는 방식뿐이라, 소모성 구매가 소비(consume)되면 목록에 나오지 않아 첫 전송이 실패한 구매는 영구히 빠졌고 첫 전송 자체도 소비와 경쟁했습니다. 0.2.2는 구매 보고를 **기기 큐**에 먼저 넣고 서버가 2xx로 받을 때까지 다시 보냅니다. 서버는 소비된 구매 토큰도 Google에서 확인할 수 있습니다.
+
+**다른 결제 SDK(RevenueCat 등)를 쓰는 앱은 결제 완료 콜백에서 구매를 직접 넘기는 호출을 써야 소모성 결제가 빠지지 않습니다.**
+
+```kotlin
+// Play Billing을 직접 쓰는 앱: onPurchasesUpdated에서 consume 전에 넘깁니다.
+override fun onPurchasesUpdated(result: BillingResult, purchases: MutableList<Purchase>?) {
+    purchases?.filter { it.purchaseState == Purchase.PurchaseState.PURCHASED }?.forEach { purchase ->
+        codefluence.purchaseCompleted(purchase, isSubscription = false)   // 구독 상품이면 true
+        consume(purchase)
+    }
+}
+
+// RevenueCat: onCompleted의 StoreTransaction에서 토큰을 넘깁니다.
+Purchases.sharedInstance.purchase(params, object : PurchaseCallback {
+    override fun onCompleted(storeTransaction: StoreTransaction, customerInfo: CustomerInfo) {
+        storeTransaction.productIds.firstOrNull()?.let { productId ->
+            codefluence.purchaseCompleted(storeTransaction.purchaseToken, productId,
+                storeTransaction.type == ProductType.SUBS, storeTransaction.orderId)
+        }
+    }
+    override fun onError(error: PurchasesError, userCancelled: Boolean) {}
+})
+```
+
+- `purchaseCompleted(purchaseToken, productId, isSubscription, orderId = null, onResult = {})`와 Play Billing `Purchase`를 받는 확장 함수 `purchaseCompleted(purchase, isSubscription, onResult = {})`(Java: `CodefluenceBilling.purchaseCompleted(sdk, purchase, isSubscription)`). Play Billing은 `compileOnly`라 확장 함수는 별도 클래스에 두어 Billing이 없는 앱에서도 다른 클래스를 깨지 않습니다.
+- 본문은 스토어 목록 보고와 같습니다: `purchaseToken`·`productId`·`kind`·확인된 `leadId`와 설치 토큰 `purchaseAccountToken`·`build`. 단건 `reportPurchase(purchase:)`도 0.2.2부터 같은 필드를 싣고 같은 큐를 거칩니다(서버의 `reported_token` 연결이 됩니다).
+- 인자 없는 `purchaseCompleted()`·`reportPurchases()`는 그대로 쓸 수 있고, 소개로 온 설치에서는 읽은 구매를 같은 큐에 넣습니다.
+- 큐에 넣는 것은 **소개로 온 설치**(확인 완료, 또는 받아들인 확인이 아직 서버에 닿지 않은 상태)뿐입니다. 소개와 무관한 설치는 아무것도 저장·전송하지 않습니다. 확인 전의 구매는 큐에서 기다렸다가 확인 직후 보내고, 소개가 사라지면(거절·영구 실패) 지웁니다.
+- 저장 내용: 구매 토큰, 상품 ID, 구독 여부, 주문 ID, 처음 넣은 시각, 시도 횟수, 다음 시도 시각. 가격·사용자 정보는 저장하지 않습니다(lead와 설치 토큰은 보낼 때 채웁니다). 위치는 `noBackupFilesDir/codefluence-purchase-queue.json`이라 자동 백업·기기 이전으로 다른 기기에 복제되지 않습니다.
+- 상한: 100건(넘으면 오래된 것부터 버림), 90일. 같은 토큰은 한 번만 들어가고, 이미 보고된 토큰은 다시 넣지 않습니다.
+- 다시 보내는 때: 결제 직후, 앱 시작(`configure`), Activity 시작(`start`를 쓴 경우), 네트워크 복구, 그리고 실행 중이면 예약된 다음 시도 시각.
+
+| 서버 응답 | 처리 |
+|---|---|
+| 2xx | 완료. 큐에서 지우고 보고 완료로 기록 |
+| 네트워크 오류·408·429·5xx | 재시도(30초 시작·2배·상한 6시간·full jitter, `CodefluenceBackoffPolicy`) |
+| 409 `credential_missing`(결제 조회 키 미등록) | 재시도(위와 같음). 개발자가 키를 등록하면 그때 받아들여집니다 |
+| 401·403(키 폐기) | 보존하고 하루 간격으로만 다시 시도(새 키가 담긴 앱 업데이트 대기) |
+| 400·404·422 등 그 밖의 4xx | 영구 거절. 큐에서 지움(목록에 남는 구매는 다음 목록 읽기 때 다시 보냄) |
+
+확인 요청(`/track/confirm`) 큐는 409를 영구 실패로 보므로 분류가 다릅니다.
 
 ## 기존 무료 사용자 귀속 옵션
 

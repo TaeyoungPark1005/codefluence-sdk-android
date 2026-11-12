@@ -170,6 +170,6 @@ class ActivitySignalTest {
         assertTrue(ActivitySignalClient.validMilestone("first_post-1.0"))
         assertFalse(ActivitySignalClient.validMilestone("")); assertFalse(ActivitySignalClient.validMilestone("한글")); assertFalse(ActivitySignalClient.validMilestone("a b"))
         assertEquals("2026-09-22", ActivitySignalClient.kstDay(now))
-        assertEquals("0.2.1", Codefluence.VERSION)
+        assertEquals("0.2.2", Codefluence.VERSION)
     }
 }

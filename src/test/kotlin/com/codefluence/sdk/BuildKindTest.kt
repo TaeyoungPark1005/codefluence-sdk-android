@@ -28,7 +28,7 @@ class BuildKindTest {
         client.validate { checks = it }
         val beats = transport.captured.filter { it.url.endsWith("/sdk/heartbeat") }.map { JSONObject(it.body) }
         assertEquals(2, beats.size)
-        assertTrue(beats.all { it.getString("build") == "debug" && it.getString("sdkVersion") == "0.2.1" })
+        assertTrue(beats.all { it.getString("build") == "debug" && it.getString("sdkVersion") == "0.2.2" })
         val build = checks.first { it.name == "빌드" }
         assertTrue("빌드 종류는 안내 항목이라 점검 실패로 치지 않는다", build.passed)
         assertTrue(build.hint, build.hint.contains("개발 빌드") && build.hint.contains("운영 집계") && build.hint.contains("들어가지 않아요"))
